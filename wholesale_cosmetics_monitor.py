@@ -17,6 +17,7 @@ Deps:  pip install playwright requests beautifulsoup4
 
 import json
 import os
+import random
 import re
 import time
 import requests
@@ -32,7 +33,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 BASE_URL       = "https://www.wholesale-cosmetics.co.uk"
 NEW_URL        = f"{BASE_URL}/products/new/"
 SNAPSHOT_FILE  = "snapshot.json"
-REQUEST_DELAY  = 1.5
+REQUEST_DELAY  = 4.0   # seconds between page fetches — increased to avoid 429s
 RUN_ONCE       = os.getenv("RUN_ONCE", "false").lower() == "true"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 HEADLESS       = os.getenv("HEADLESS", "true").lower() == "true"
@@ -69,21 +70,39 @@ def make_browser(playwright):
     return browser, context
 
 
-def fetch_html(context, url, wait_selector=None, timeout=20000):
-    page = context.new_page()
-    try:
-        page.goto(url, timeout=timeout, wait_until="domcontentloaded")
-        if wait_selector:
+def fetch_html(context, url, wait_selector=None, timeout=20000, retries=3):
+    """Fetch page HTML with automatic retry on 429 / Too Many Requests."""
+    for attempt in range(retries):
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            if wait_selector:
+                try:
+                    page.wait_for_selector(wait_selector, timeout=8000)
+                except PWTimeout:
+                    pass
+            html = page.content()
+
+            # Detect rate limiting via page title
+            title = page.title()
+            if "too many requests" in title.lower() or "429" in title:
+                wait_secs = 15 * (attempt + 1)
+                print(f"  [!] Rate limited (attempt {attempt+1}/{retries}) — waiting {wait_secs}s")
+                page.close()
+                time.sleep(wait_secs)
+                continue
+
+            return html
+        except Exception as e:
+            print(f"  [!] Fetch error ({url}): {e} — attempt {attempt+1}/{retries}")
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+        finally:
             try:
-                page.wait_for_selector(wait_selector, timeout=8000)
-            except PWTimeout:
+                page.close()
+            except Exception:
                 pass
-        return page.content()
-    except Exception as e:
-        print(f"  [!] Fetch error ({url}): {e}")
-        return None
-    finally:
-        page.close()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -579,10 +598,10 @@ def run_check():
 
                 # Always fetch detail + stock for new products
                 # For existing: fetch detail + stock to detect changes
-                time.sleep(REQUEST_DELAY)
+                time.sleep(REQUEST_DELAY + random.uniform(0, 2))
                 product = scrape_product_detail(context, product)
 
-                time.sleep(REQUEST_DELAY)
+                time.sleep(REQUEST_DELAY + random.uniform(0, 2))
                 packs, units = get_stock_from_page(
                     context, product["url"], product.get("pack_size", "1")
                 )
