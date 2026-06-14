@@ -141,7 +141,8 @@ def parse_listing_page(html):
             pu = re.search(r"\(£?([\d.]+)\s*per unit\)", ct)
             if pu: per_unit = pu.group(1)
 
-        full_url = href if href.startswith("http") else BASE_URL + href
+        # Use ID-only URL to avoid slug-based redirects to wrong products
+        full_url = f"{BASE_URL}/product/{slug}/{pid}/"
         products.append({
             "id": pid, "slug": slug, "title": title,
             "pack_price": pack_price, "reduced_price": reduced_price,
@@ -194,22 +195,31 @@ def scrape_product_detail(context, product):
     sku_m = re.search(r"\b([A-Z0-9]{5,20})\b\s+\d{13}", text)
     product["sku"] = sku_m.group(1) if sku_m else ""
 
-    ps = re.search(r"Pack Size:\s*(\d+)\s*units?", text)
-    product["pack_size"] = ps.group(1) if ps else ""
+    # pack_size already set in price block above if found; fallback here
+    if not product.get("pack_size"):
+        ps = re.search(r"Pack Size:\s*(\d+)\s*units?", product_section)
+        product["pack_size"] = ps.group(1) if ps else ""
 
-    rrp = re.search(r"RRP\s*£?([\d.]+)", text)
+    rrp = re.search(r"RRP\s*£?([\d.]+)\s*each", product_section)
     product["rrp"] = rrp.group(1) if rrp else ""
 
     if not product["title"]:
         h1 = soup.find("h1")
         product["title"] = h1.get_text(strip=True) if h1 else product["slug"].replace("-", " ").title()
 
-    pp = re.search(r"Price:\s*£([\d.]+)", text)
+    # Restrict price parsing to the product's own section (before "Related Products")
+    # to avoid picking up prices from related product cards on the page
+    related_idx = text.find("Related Products")
+    product_section = text[:related_idx] if related_idx > 0 else text
+
+    pp = re.search(r"Price:\s*£([\d.]+)", product_section)
     if pp: product["pack_price"] = pp.group(1)
-    rp = re.search(r"Reduced:\s*£([\d.]+)", text)
+    rp = re.search(r"Reduced:\s*£([\d.]+)", product_section)
     if rp: product["reduced_price"] = rp.group(1)
-    pu = re.search(r"\(£([\d.]+)\s*per unit\)", text)
+    pu = re.search(r"Pack Size:\s*\d+\s*units?\s*@\s*£([\d.]+)\s*each", product_section)
     if pu: product["per_unit"] = pu.group(1)
+    ps_match = re.search(r"Pack Size:\s*(\d+)\s*units?", product_section)
+    if ps_match: product["pack_size"] = ps_match.group(1)
 
     img_tag = soup.find("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE))
     product["image"] = (BASE_URL + img_tag["src"]) if img_tag else ""
