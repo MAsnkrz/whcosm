@@ -176,7 +176,7 @@ def scrape_all_new_arrivals(context):
         if not soup.find("a", href=re.compile(rf"/products/new/{page_num + 1}/")):
             break
         page_num += 1
-        time.sleep(REQUEST_DELAY)
+        time.sleep(REQUEST_DELAY * 2)  # extra delay between listing pages
     return all_products
 
 
@@ -195,31 +195,32 @@ def scrape_product_detail(context, product):
     sku_m = re.search(r"\b([A-Z0-9]{5,20})\b\s+\d{13}", text)
     product["sku"] = sku_m.group(1) if sku_m else ""
 
-    # pack_size already set in price block above if found; fallback here
-    if not product.get("pack_size"):
-        ps = re.search(r"Pack Size:\s*(\d+)\s*units?", product_section)
-        product["pack_size"] = ps.group(1) if ps else ""
+    # Restrict all parsing to before "Related Products" to avoid picking up
+    # prices/data from related product cards at the bottom of the page
+    related_idx = text.find("Related Products")
+    product_section = text[:related_idx] if related_idx > 0 else text
 
+    # Prices — read from product section only
+    pp = re.search(r"Price:\s*£([\d.]+)", product_section)
+    if pp: product["pack_price"] = pp.group(1)
+    rp = re.search(r"Reduced:\s*£([\d.]+)", product_section)
+    if rp: product["reduced_price"] = rp.group(1)
+
+    # Per unit — from "Pack Size: N units @ £X.XX each"
+    pu = re.search(r"Pack Size:\s*\d+\s*units?\s*@\s*£([\d.]+)\s*each", product_section)
+    if pu: product["per_unit"] = pu.group(1)
+
+    # Pack size
+    ps_match = re.search(r"Pack Size:\s*(\d+)\s*units?", product_section)
+    if ps_match: product["pack_size"] = ps_match.group(1)
+
+    # RRP
     rrp = re.search(r"RRP\s*£?([\d.]+)\s*each", product_section)
     product["rrp"] = rrp.group(1) if rrp else ""
 
     if not product["title"]:
         h1 = soup.find("h1")
         product["title"] = h1.get_text(strip=True) if h1 else product["slug"].replace("-", " ").title()
-
-    # Restrict price parsing to the product's own section (before "Related Products")
-    # to avoid picking up prices from related product cards on the page
-    related_idx = text.find("Related Products")
-    product_section = text[:related_idx] if related_idx > 0 else text
-
-    pp = re.search(r"Price:\s*£([\d.]+)", product_section)
-    if pp: product["pack_price"] = pp.group(1)
-    rp = re.search(r"Reduced:\s*£([\d.]+)", product_section)
-    if rp: product["reduced_price"] = rp.group(1)
-    pu = re.search(r"Pack Size:\s*\d+\s*units?\s*@\s*£([\d.]+)\s*each", product_section)
-    if pu: product["per_unit"] = pu.group(1)
-    ps_match = re.search(r"Pack Size:\s*(\d+)\s*units?", product_section)
-    if ps_match: product["pack_size"] = ps_match.group(1)
 
     img_tag = soup.find("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE))
     product["image"] = (BASE_URL + img_tag["src"]) if img_tag else ""
