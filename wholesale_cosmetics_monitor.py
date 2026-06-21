@@ -217,8 +217,25 @@ def scrape_product_detail(context, product):
         h1 = soup.find("h1")
         product["title"] = h1.get_text(strip=True) if h1 else product["slug"].replace("-", " ").title()
 
-    img_tag = soup.find("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE))
-    product["image"] = (BASE_URL + img_tag["src"]) if img_tag else ""
+    # Prefer og:image meta tag — it's the canonical product image and
+    # avoids accidentally picking up images from "Related Products" cards
+    og_img = soup.find("meta", property="og:image")
+    if og_img and og_img.get("content"):
+        product["image"] = og_img["content"]
+    else:
+        # Fallback: first image within the main product section only
+        # (product_section text already excludes "Related Products" text,
+        # but for the image we need to search the DOM before that heading)
+        related_heading = soup.find(string=re.compile(r"Related Products", re.IGNORECASE))
+        if related_heading:
+            # Search only images that appear before the Related Products heading in the DOM
+            for img in soup.find_all("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE)):
+                if img.sourceline and related_heading.sourceline and img.sourceline < related_heading.sourceline:
+                    product["image"] = BASE_URL + img["src"]
+                    break
+        if not product.get("image"):
+            img_tag = soup.find("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE))
+            product["image"] = (BASE_URL + img_tag["src"]) if img_tag else ""
 
     return product
 
@@ -561,12 +578,14 @@ def check_changes(product, old):
 def run_check():
     print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Running check...")
 
+    snapshot      = load_snapshot()
+    known_ids     = set(snapshot.keys())
+    baseline_done = os.path.exists("baseline_done.txt")
+    is_first_run  = not baseline_done
+
     with sync_playwright() as pw:
         browser, context = make_browser(pw)
         try:
-            snapshot = load_snapshot()
-            known_ids = set(snapshot.keys())
-
             # 1. Scrape all listing pages
             all_products = scrape_all_new_arrivals(context)
             if not all_products:
@@ -574,16 +593,18 @@ def run_check():
                 return
 
             current_ids = {p["id"] for p in all_products}
-            new_ids = current_ids - known_ids
-            print(f"  {len(all_products)} products found, {len(new_ids)} new, "
-                  f"{len(current_ids - new_ids)} existing to check")
+            new_ids     = current_ids - known_ids
 
-            for product in all_products:
+            if is_first_run:
+                print(f"  First run — building baseline from {len(all_products)} products (no alerts)...")
+            else:
+                print(f"  {len(all_products)} products found, {len(new_ids)} new, "
+                      f"{len(current_ids - new_ids)} existing to check")
+
+            for i, product in enumerate(all_products, 1):
                 pid = product["id"]
                 is_new = pid in new_ids
 
-                # Always fetch detail + stock for new products
-                # For existing: fetch detail + stock to detect changes
                 time.sleep(REQUEST_DELAY + random.uniform(0, 2))
                 product = scrape_product_detail(context, product)
 
@@ -594,7 +615,10 @@ def run_check():
                 product["packs_in_stock"] = packs
                 product["units_in_stock"] = units
 
-                if is_new:
+                if is_first_run:
+                    # Silent baseline — no Discord alerts at all
+                    snapshot[pid] = snapshot_entry(product)
+                elif is_new:
                     in_stock_now = product.get("packs_in_stock") is not None and product["packs_in_stock"] > 0
                     if in_stock_now:
                         print(f"  -> NEW: [{pid}] {product['title']}")
@@ -606,11 +630,19 @@ def run_check():
                 else:
                     old = snapshot[pid]
                     updated = check_changes(product, old)
-                    # Always update snapshot with latest data
                     updated["first_seen"] = old.get("first_seen", updated["first_seen"])
                     snapshot[pid] = updated
 
+                if i % 20 == 0:
+                    save_snapshot(snapshot)
+                    print(f"  Auto-saved at {i}/{len(all_products)}")
+
             save_snapshot(snapshot)
+
+            if is_first_run:
+                with open("baseline_done.txt", "w") as f:
+                    f.write(datetime.now(timezone.utc).isoformat())
+                print(f"  Baseline complete — {len(snapshot)} products recorded. No alerts sent.")
             print(f"  Snapshot saved ({len(snapshot)} products tracked)")
 
         finally:
