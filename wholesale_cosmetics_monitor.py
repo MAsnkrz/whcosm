@@ -2,14 +2,15 @@
 Wholesale Cosmetics Monitor
 Monitors https://www.wholesale-cosmetics.co.uk/products/new/
 
-Detects and alerts on Discord for:
-  - New product listings
-  - Price drops
-  - Price increases
-  - Stock increases (restock)
-  - Stock decreases
-  - Out of stock
-  - Back in stock
+Detects (Discord alerts fire ONLY for these):
+  - New product listings (in stock only)
+  - Price drops (decreased >1% and >£0.02)
+  - Restocks (packs increased by >30%, min +3) / Back in stock
+
+Does NOT alert on: price increases, stock decreases, going OOS.
+
+Note: stock is read via a JS quantity-cap trick (no login needed) which can
+have minor run-to-run noise, hence the relative+absolute restock threshold.
 
 Deps:  pip install playwright requests beautifulsoup4
        python -m playwright install chromium
@@ -33,24 +34,18 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 BASE_URL       = "https://www.wholesale-cosmetics.co.uk"
 NEW_URL        = f"{BASE_URL}/products/new/"
 SNAPSHOT_FILE  = "snapshot.json"
-REQUEST_DELAY  = 4.0   # seconds between page fetches — increased to avoid 429s
+REQUEST_DELAY  = 3.0   # seconds between page fetches — tuned to avoid 429s while staying efficient
 RUN_ONCE       = os.getenv("RUN_ONCE", "false").lower() == "true"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 HEADLESS       = os.getenv("HEADLESS", "true").lower() == "true"
 
-DISCORD_WEBHOOK = os.getenv(
-    "DISCORD_WEBHOOK",
-    "https://discord.com/api/webhooks/1515746540453625906/NrYIHjN-RqfuqV-gAqL8WIL3roU1XxYJfzRz9vXGJ7uwuFEA7-zF4-MWyW2aBq89Vpl7"
-)
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 # Discord embed colours
-COLOUR_NEW        = 0xE91E8C   # Pink    — new product
-COLOUR_PRICE_DROP = 0x2ECC71   # Green   — price drop
-COLOUR_PRICE_UP   = 0xE74C3C   # Red     — price increase
-COLOUR_RESTOCK    = 0x3498DB   # Blue    — stock went up
-COLOUR_LOW_STOCK  = 0xF39C12   # Orange  — stock went down
-COLOUR_OOS        = 0x95A5A6   # Grey    — out of stock
-COLOUR_BACK       = 0x9B59B6   # Purple  — back in stock
+COLOUR_NEW     = 0xE91E8C   # pink — new listing
+COLOUR_RESTOCK = 0x3498DB   # blue — restock
+COLOUR_BACK    = 0x9B59B6   # purple — back in stock
+# Price drop colours are tiered by severity — see notify_price_change()
 
 # ---------------------------------------------------------------------------
 # BROWSER
@@ -373,32 +368,38 @@ def notify_new(product):
     _send_embed(embed)
 
 
-def notify_price_change(product, old_price, new_price, is_drop):
-    per_unit   = product.get("per_unit", "")
-    old_f      = safe_float(old_price)
-    new_f      = safe_float(new_price)
-    diff       = f"£{abs(new_f - old_f):.2f}" if old_f and new_f else "?"
-    pct        = f"{abs((new_f - old_f) / old_f * 100):.1f}%" if old_f and new_f else "?"
+def notify_price_change(product, old_price, new_price, pct_change):
+    """
+    pct_change is a fraction (e.g. 0.05 = 5% drop). Always a drop —
+    price increases are no longer tracked.
+    Colour tier scales with drop severity for quick visual triage.
+    """
+    per_unit = product.get("per_unit", "")
+    old_f    = safe_float(old_price)
+    new_f    = safe_float(new_price)
+    diff     = f"£{abs(new_f - old_f):.2f}" if old_f and new_f else "?"
+    pct_display = f"{pct_change * 100:.1f}%"
 
-    if is_drop:
-        title  = f"💰  PRICE DROP — {product.get('title', '')}"
-        colour = COLOUR_PRICE_DROP
-        change = f"↓ -{diff} (-{pct})"
+    if pct_change >= 0.20:
+        colour = 0x00C853   # deep green — big drop (20%+)
+        tier   = "🔥"
+    elif pct_change >= 0.10:
+        colour = 0x2ECC71   # green — solid drop (10-20%)
+        tier   = "💰"
     else:
-        title  = f"📈  PRICE INCREASE — {product.get('title', '')}"
-        colour = COLOUR_PRICE_UP
-        change = f"↑ +{diff} (+{pct})"
+        colour = 0x82E0AA   # light green — small drop (1-10%)
+        tier   = "💵"
 
     fields = [
-        {"name": "💰 Old Pack Price", "value": f"£{old_price}",  "inline": True},
-        {"name": "💰 New Pack Price", "value": f"**£{new_price}**", "inline": True},
-        {"name": "📉 Change",         "value": change,            "inline": True},
+        {"name": "💰 Old Pack Price", "value": f"£{old_price}",            "inline": True},
+        {"name": "💰 New Pack Price", "value": f"**£{new_price}**",        "inline": True},
+        {"name": "📉 Drop",           "value": f"↓ {diff} (**{pct_display}**)", "inline": True},
         {"name": "💷 Per Unit (ex. VAT)",  "value": f"£{per_unit}" if per_unit else "-",            "inline": True},
         {"name": "💷 Per Unit (inc. VAT)", "value": f"£{vat_price(per_unit)}" if per_unit else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
-        "title":     title,
+        "title":     f"{tier}  PRICE DROP -{pct_display} — {product.get('title', '')}",
         "url":       product.get("url", BASE_URL),
         "color":     colour,
         "fields":    fields,
@@ -408,49 +409,27 @@ def notify_price_change(product, old_price, new_price, is_drop):
     thumb = _thumbnail(product)
     if thumb: embed["thumbnail"] = thumb
     _send_embed(embed)
+    print(f"  Discord: PRICE DROP -{pct_display} — {product.get('title', '')[:50]}")
 
 
-def notify_stock_change(product, old_packs, new_packs, is_restock):
+def notify_stock_change(product, old_packs, new_packs):
+    """Restock only — stock decreases are no longer tracked."""
     pack_size = product.get("pack_size", "1")
     ps        = int(pack_size) if str(pack_size).isdigit() else 1
     old_units = old_packs * ps if old_packs is not None else "?"
     new_units = new_packs * ps if new_packs is not None else "?"
     diff_packs = (new_packs - old_packs) if (new_packs is not None and old_packs is not None) else "?"
 
-    if is_restock:
-        title  = f"🟢  RESTOCK — {product.get('title', '')}"
-        colour = COLOUR_RESTOCK
-        arrow  = f"↑ +{diff_packs} packs"
-    else:
-        title  = f"📉  STOCK DROP — {product.get('title', '')}"
-        colour = COLOUR_LOW_STOCK
-        arrow  = f"↓ {diff_packs} packs"
-
     fields = [
-        {"name": "📊 Old Stock", "value": f"{old_packs} packs / {old_units} units", "inline": True},
+        {"name": "📊 Old Stock", "value": f"{old_packs} packs / {old_units} units",     "inline": True},
         {"name": "📊 New Stock", "value": f"**{new_packs} packs / {new_units} units**", "inline": True},
-        {"name": "📉 Change",    "value": arrow,                                        "inline": True},
+        {"name": "📈 Change",    "value": f"↑ +{diff_packs} packs" if isinstance(diff_packs, int) else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
-        "title":     title,
+        "title":     f"🟢  RESTOCK — {product.get('title', '')}",
         "url":       product.get("url", BASE_URL),
-        "color":     colour,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Wholesale Cosmetics Monitor • wholesale-cosmetics.co.uk"},
-    }
-    thumb = _thumbnail(product)
-    if thumb: embed["thumbnail"] = thumb
-    _send_embed(embed)
-
-
-def notify_oos(product):
-    fields = _base_fields(product)
-    embed = {
-        "title":     f"🔴  OUT OF STOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_OOS,
+        "color":     COLOUR_RESTOCK,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer":    {"text": "Wholesale Cosmetics Monitor • wholesale-cosmetics.co.uk"},
@@ -497,21 +476,21 @@ def save_snapshot(data):
 
 
 def snapshot_entry(product):
-    """Build the snapshot record for a product."""
+    """Build the snapshot record for a product. Preserves first_seen if already set."""
     return {
-        "title":         product.get("title", ""),
-        "url":           product.get("url", ""),
-        "barcode":       product.get("barcode", ""),
-        "image":         product.get("image", ""),
-        "pack_price":    product.get("pack_price", ""),
-        "reduced_price": product.get("reduced_price", ""),
-        "per_unit":      product.get("per_unit", ""),
-        "pack_size":     product.get("pack_size", ""),
-        "rrp":           product.get("rrp", ""),
+        "title":          product.get("title", ""),
+        "url":            product.get("url", ""),
+        "barcode":        product.get("barcode", ""),
+        "image":          product.get("image", ""),
+        "pack_price":     product.get("pack_price", ""),
+        "reduced_price":  product.get("reduced_price", ""),
+        "per_unit":       product.get("per_unit", ""),
+        "pack_size":      product.get("pack_size", ""),
+        "rrp":            product.get("rrp", ""),
         "packs_in_stock": product.get("packs_in_stock"),
-        "in_stock":      product.get("packs_in_stock", 0) is not None and (product.get("packs_in_stock") or 0) > 0,
-        "first_seen":    datetime.now(timezone.utc).isoformat(),
-        "last_updated":  datetime.now(timezone.utc).isoformat(),
+        "in_stock":       product.get("packs_in_stock") is not None and product.get("packs_in_stock", 0) > 0,
+        "first_seen":     product.get("first_seen", datetime.now(timezone.utc).isoformat()),
+        "last_updated":   datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -522,13 +501,17 @@ def snapshot_entry(product):
 def check_changes(product, old):
     """
     Compare current product data against snapshot.
-    Fires relevant Discord notifications for any changes found.
+    Only fires alerts for:
+      - Back in stock (was OOS, now has stock) — takes priority
+      - Restock (packs increased meaningfully while already in stock)
+      - Price drop (decreased by more than 1% AND more than £0.02)
+    No alerts for: price increases, stock decreases, going OOS.
     Returns updated snapshot entry.
     """
-    old_price   = old.get("reduced_price") or old.get("pack_price") or ""
-    new_price   = product.get("reduced_price") or product.get("pack_price") or ""
-    old_packs   = old.get("packs_in_stock")
-    new_packs   = product.get("packs_in_stock")
+    old_price    = old.get("reduced_price") or old.get("pack_price") or ""
+    new_price    = product.get("reduced_price") or product.get("pack_price") or ""
+    old_packs    = old.get("packs_in_stock")
+    new_packs    = product.get("packs_in_stock")
     was_in_stock = old.get("in_stock", True)
     now_in_stock = new_packs is not None and new_packs > 0
 
@@ -541,39 +524,31 @@ def check_changes(product, old):
     if not product.get("rrp"):        product["rrp"]      = old.get("rrp", "")
     if not product.get("pack_size"):  product["pack_size"] = old.get("pack_size", "")
 
-    # 1. Back in stock
+    # Back in stock takes priority over everything else
     if not was_in_stock and now_in_stock:
         print(f"  -> BACK IN STOCK: {product['title']}")
         notify_back_in_stock(product)
         time.sleep(1)
+        return snapshot_entry(product)
 
-    # 2. Out of stock
-    elif was_in_stock and not now_in_stock and new_packs is not None:
-        print(f"  -> OUT OF STOCK: {product['title']}")
-        notify_oos(product)
-        time.sleep(1)
-
-    # 3. Price drop
-    elif old_f and new_f and new_f < old_f - 0.01:
-        print(f"  -> PRICE DROP: {product['title']} £{old_price} -> £{new_price}")
-        notify_price_change(product, old_price, new_price, is_drop=True)
-        time.sleep(1)
-
-    # 4. Price increase
-    elif old_f and new_f and new_f > old_f + 0.01:
-        print(f"  -> PRICE UP: {product['title']} £{old_price} -> £{new_price}")
-        notify_price_change(product, old_price, new_price, is_drop=False)
-        time.sleep(1)
-
-    # 5. Restock (stock went up)
-    if old_packs is not None and new_packs is not None and now_in_stock:
-        if new_packs > old_packs + 2:  # +2 buffer to avoid noise
-            print(f"  -> RESTOCK: {product['title']} {old_packs} -> {new_packs} packs")
-            notify_stock_change(product, old_packs, new_packs, is_restock=True)
+    # Price drop — require both a meaningful % AND absolute change
+    if old_f and new_f and old_f > 0:
+        pct_change = (old_f - new_f) / old_f
+        abs_change = old_f - new_f
+        if pct_change > 0.01 and abs_change > 0.02:
+            print(f"  -> PRICE DROP: {product['title']} £{old_price} -> £{new_price}")
+            notify_price_change(product, old_price, new_price, pct_change)
             time.sleep(1)
-        elif new_packs < old_packs - 2:
-            print(f"  -> STOCK DROP: {product['title']} {old_packs} -> {new_packs} packs")
-            notify_stock_change(product, old_packs, new_packs, is_restock=False)
+
+    # Restock — only while staying in stock. Packs are small numbers (often
+    # capped by per-customer limits), so use a relative+absolute threshold
+    # rather than a tiny fixed +2, which was causing constant false positives
+    # from the JS quantity-cap trick's natural fluctuation.
+    if old_packs is not None and new_packs is not None and was_in_stock and now_in_stock:
+        threshold = max(3, int(old_packs * 0.3))
+        if new_packs > old_packs + threshold:
+            print(f"  -> RESTOCK: {product['title']} {old_packs} -> {new_packs} packs")
+            notify_stock_change(product, old_packs, new_packs)
             time.sleep(1)
 
     return snapshot_entry(product)
@@ -620,9 +595,13 @@ def run_check():
                 product["units_in_stock"] = units
 
                 if is_new:
-                    print(f"  -> NEW: [{pid}] {product['title']}")
-                    notify_new(product)
-                    time.sleep(1.5)
+                    in_stock_now = product.get("packs_in_stock") is not None and product["packs_in_stock"] > 0
+                    if in_stock_now:
+                        print(f"  -> NEW: [{pid}] {product['title']}")
+                        notify_new(product)
+                        time.sleep(1.5)
+                    else:
+                        print(f"  -> NEW (OOS, no alert): [{pid}] {product['title']}")
                     snapshot[pid] = snapshot_entry(product)
                 else:
                     old = snapshot[pid]
