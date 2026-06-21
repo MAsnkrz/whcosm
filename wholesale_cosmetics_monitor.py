@@ -217,11 +217,14 @@ def scrape_product_detail(context, product):
         h1 = soup.find("h1")
         product["title"] = h1.get_text(strip=True) if h1 else product["slug"].replace("-", " ").title()
 
-    # Prefer og:image meta tag — it's the canonical product image and
-    # avoids accidentally picking up images from "Related Products" cards
+    # Prefer og:image meta tag — BUT this site's og:image is broken on
+    # every product page (it's just "https://.../images/" with no
+    # filename), so we must reject that and fall through to the real
+    # product image pattern below.
     og_img = soup.find("meta", property="og:image")
-    if og_img and og_img.get("content"):
-        product["image"] = og_img["content"]
+    og_content = og_img["content"] if og_img and og_img.get("content") else ""
+    if og_content and re.search(r"/images/.+\.(jpg|jpeg|png|webp)", og_content, re.IGNORECASE):
+        product["image"] = og_content
     else:
         # Fallback: first image within the main product section only
         # (product_section text already excludes "Related Products" text,
@@ -231,11 +234,11 @@ def scrape_product_detail(context, product):
             # Search only images that appear before the Related Products heading in the DOM
             for img in soup.find_all("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE)):
                 if img.sourceline and related_heading.sourceline and img.sourceline < related_heading.sourceline:
-                    product["image"] = BASE_URL + img["src"]
+                    product["image"] = BASE_URL + quote(img["src"], safe="/:")
                     break
         if not product.get("image"):
             img_tag = soup.find("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE))
-            product["image"] = (BASE_URL + img_tag["src"]) if img_tag else ""
+            product["image"] = (BASE_URL + quote(img_tag["src"], safe="/:")) if img_tag else ""
 
     return product
 
@@ -356,7 +359,7 @@ def _send_embed(embed):
 
 def _thumbnail(product):
     image = product.get("image", "")
-    return {"url": quote(image, safe=":/?=&")} if image else None
+    return {"url": image} if image else None
 
 
 def notify_new(product):
@@ -494,6 +497,14 @@ def save_snapshot(data):
 
 def snapshot_entry(product):
     """Build the snapshot record for a product. Preserves first_seen if already set."""
+    packs = product.get("packs_in_stock")
+    # Respect an explicitly-set in_stock (e.g. carried forward after a
+    # failed stock probe) rather than always recomputing from packs alone.
+    if "in_stock" in product:
+        in_stock = product["in_stock"]
+    else:
+        in_stock = packs is not None and packs > 0
+
     return {
         "title":          product.get("title", ""),
         "url":            product.get("url", ""),
@@ -504,8 +515,8 @@ def snapshot_entry(product):
         "per_unit":       product.get("per_unit", ""),
         "pack_size":      product.get("pack_size", ""),
         "rrp":            product.get("rrp", ""),
-        "packs_in_stock": product.get("packs_in_stock"),
-        "in_stock":       product.get("packs_in_stock") is not None and product.get("packs_in_stock", 0) > 0,
+        "packs_in_stock": packs,
+        "in_stock":       in_stock,
         "first_seen":     product.get("first_seen", datetime.now(timezone.utc).isoformat()),
         "last_updated":   datetime.now(timezone.utc).isoformat(),
     }
@@ -523,6 +534,13 @@ def check_changes(product, old):
       - Restock (packs increased meaningfully while already in stock)
       - Price drop (decreased by more than 1% AND more than £0.02)
     No alerts for: price increases, stock decreases, going OOS.
+
+    IMPORTANT: if the stock probe failed this run (packs_in_stock is None,
+    e.g. a timeout loading the page), we do NOT treat that as "out of
+    stock" — that previously caused false "back in stock" alerts on the
+    next successful run, since a single transient failure made it look
+    like the product had gone OOS and come back. Instead we carry the
+    previous known stock state forward unchanged.
     Returns updated snapshot entry.
     """
     old_price    = old.get("reduced_price") or old.get("pack_price") or ""
@@ -530,7 +548,17 @@ def check_changes(product, old):
     old_packs    = old.get("packs_in_stock")
     new_packs    = product.get("packs_in_stock")
     was_in_stock = old.get("in_stock", True)
-    now_in_stock = new_packs is not None and new_packs > 0
+
+    probe_failed = new_packs is None
+    if probe_failed:
+        # Carry forward the last known stock state rather than assuming OOS
+        new_packs = old_packs
+        now_in_stock = was_in_stock
+        product["packs_in_stock"] = old.get("packs_in_stock")
+        product["units_in_stock"] = old.get("units_in_stock")
+        product["in_stock"] = was_in_stock
+    else:
+        now_in_stock = new_packs > 0
 
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
@@ -541,8 +569,9 @@ def check_changes(product, old):
     if not product.get("rrp"):        product["rrp"]      = old.get("rrp", "")
     if not product.get("pack_size"):  product["pack_size"] = old.get("pack_size", "")
 
-    # Back in stock takes priority over everything else
-    if not was_in_stock and now_in_stock:
+    # Back in stock takes priority over everything else — but only fires
+    # when we have a genuine new reading, not a carried-forward one
+    if not probe_failed and not was_in_stock and now_in_stock:
         print(f"  -> BACK IN STOCK: {product['title']}")
         notify_back_in_stock(product)
         time.sleep(1)
@@ -557,11 +586,12 @@ def check_changes(product, old):
             notify_price_change(product, old_price, new_price, pct_change)
             time.sleep(1)
 
-    # Restock — only while staying in stock. Packs are small numbers (often
-    # capped by per-customer limits), so use a relative+absolute threshold
-    # rather than a tiny fixed +2, which was causing constant false positives
-    # from the JS quantity-cap trick's natural fluctuation.
-    if old_packs is not None and new_packs is not None and was_in_stock and now_in_stock:
+    # Restock — only while staying in stock, and only on a genuine reading.
+    # Packs are small numbers (often capped by per-customer limits), so use
+    # a relative+absolute threshold rather than a tiny fixed +2, which was
+    # causing constant false positives from the JS quantity-cap trick's
+    # natural fluctuation.
+    if not probe_failed and old_packs is not None and new_packs is not None and was_in_stock and now_in_stock:
         threshold = max(3, int(old_packs * 0.3))
         if new_packs > old_packs + threshold:
             print(f"  -> RESTOCK: {product['title']} {old_packs} -> {new_packs} packs")
