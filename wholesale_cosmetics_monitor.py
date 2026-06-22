@@ -229,11 +229,11 @@ def scrape_product_detail(context, product):
         # Fallback: first image within the main product section only
         # (product_section text already excludes "Related Products" text,
         # but for the image we need to search the DOM before that heading)
-        related_heading = soup.find(string=re.compile(r"Related Products", re.IGNORECASE))
-        if related_heading:
-            # Search only images that appear before the Related Products heading in the DOM
+        related_tag = soup.find(lambda t: t.name and "related products" in t.get_text(strip=True).lower())
+        product["image"] = ""
+        if related_tag and getattr(related_tag, "sourceline", None):
             for img in soup.find_all("img", src=re.compile(r"/images/C[\s(]", re.IGNORECASE)):
-                if img.sourceline and related_heading.sourceline and img.sourceline < related_heading.sourceline:
+                if getattr(img, "sourceline", None) and img.sourceline < related_tag.sourceline:
                     product["image"] = BASE_URL + quote(img["src"], safe="/:")
                     break
         if not product.get("image"):
