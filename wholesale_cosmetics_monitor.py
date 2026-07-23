@@ -99,22 +99,19 @@ def parse_listing_page(html):
     """
     Parse one listing page. Returns (products list, has_next bool).
 
-    Price extraction looks at text STRICTLY between consecutive product
-    title h3 elements to prevent price bleed from adjacent products.
-    Image is taken from the product card img, not og:image (which is
-    broken on this site — returns a URL with no filename).
+    Structure confirmed via browser inspection:
+      - Each product is in a div.col-lg-4.col-md-4
+      - Title link is in div.product-title > a[href*="/product/"]
+      - Prices are in div.product-price (text contains Pack Price/Reduced/per unit)
+      - Image is in div.product-image > img
     """
     soup = BeautifulSoup(html, "html.parser")
     products = []
+    seen_ids = set()
 
-    # Find all product title links — format: /product/slug/ID/
-    product_h3s = [
-        h for h in soup.find_all(["h3", "h2"])
-        if h.find("a", href=lambda h: h and "/product/" in h)
-    ]
-
-    for idx, h3 in enumerate(product_h3s):
-        link = h3.find("a", href=lambda h: h and "/product/" in h)
+    # Find all product title divs — each has exactly one /product/ link
+    for title_div in soup.find_all("div", class_="product-title"):
+        link = title_div.find("a", href=re.compile(r"/product/[^/]+/\d+/"))
         if not link:
             continue
 
@@ -123,60 +120,57 @@ def parse_listing_page(html):
         if not product_url.startswith("http"):
             product_url = BASE_URL + product_url
 
-        # Extract product ID from URL: /product/slug/ID/
+        # Product ID from URL
         id_m = re.search(r"/product/[^/]+/(\d+)/?$", product_url)
         if not id_m:
             continue
         product_id = id_m.group(1)
+        if product_id in seen_ids:
+            continue
+        seen_ids.add(product_id)
 
-        # Get text STRICTLY between this h3 and the next one
-        # Prevents price/image bleed from adjacent products
-        text_between = []
-        node = h3.next_sibling
-        next_h3 = product_h3s[idx + 1] if idx + 1 < len(product_h3s) else None
-        while node and node != next_h3:
-            if hasattr(node, "get_text"):
-                t = node.get_text(" ", strip=True)
-                if t:
-                    text_between.append(t)
-            elif isinstance(node, str):
-                text_between.append(node.strip())
-            node = node.next_sibling
-        text = " ".join(text_between)
+        # Walk up to the col-lg-4 card container
+        card = title_div.parent
+        for _ in range(4):
+            if card is None:
+                break
+            cls = " ".join(card.get("class", []))
+            if "col-lg" in cls or "col-md" in cls or card.name == "li":
+                break
+            card = card.parent
 
-        # Prices
-        m_reduced = re.search(r"Reduced:\s*£?\s*([\d.]+)", text, re.IGNORECASE)
-        m_pack    = re.search(r"Pack\s+Price:\s*£?\s*([\d.]+)", text, re.IGNORECASE)
-        m_unit    = re.search(r"\(£?\s*([\d.]+)\s*per\s*unit\)", text, re.IGNORECASE)
-        m_bogof   = re.search(r"WITH\s+BOGOF:\s*\(£?\s*([\d.]+)\s*per\s*unit\)", text, re.IGNORECASE)
+        pack_price = reduced_price = per_unit = ""
+        image = ""
+        is_bogof = False
 
-        pack_price    = m_pack.group(1) if m_pack else ""
-        reduced_price = m_reduced.group(1) if m_reduced else ""
-        per_unit      = m_bogof.group(1) if m_bogof else (m_unit.group(1) if m_unit else "")
-        is_bogof      = bool(m_bogof)
+        if card:
+            # Prices from .product-price div
+            price_div = card.find(class_=re.compile(r"product-price"))
+            if price_div:
+                ptext = price_div.get_text(" ", strip=True)
+                m_pack    = re.search(r"Pack\s+Price:\s*£?([\d.]+)", ptext, re.IGNORECASE)
+                m_reduced = re.search(r"Reduced:\s*£?([\d.]+)", ptext, re.IGNORECASE)
+                m_unit    = re.search(r"\(£?([\d.]+)\s*per\s*unit\)", ptext, re.IGNORECASE)
+                m_bogof   = re.search(r"WITH\s+BOGOF:\s*\(£?([\d.]+)\s*per\s*unit\)", ptext, re.IGNORECASE)
+                pack_price    = m_pack.group(1) if m_pack else ""
+                reduced_price = m_reduced.group(1) if m_reduced else ""
+                per_unit      = m_bogof.group(1) if m_bogof else (m_unit.group(1) if m_unit else "")
+                is_bogof      = bool(m_bogof)
+
+            # Image from .product-image div
+            img_div = card.find(class_="product-image")
+            if img_div:
+                img_tag = img_div.find("img")
+                if img_tag:
+                    src = img_tag.get("src", "")
+                    if src and "blank" not in src.lower():
+                        image = src if src.startswith("http") else BASE_URL + src
 
         # Pack qty from title
         pack_qty = 1
         m_qty = re.match(r"^(\d+)\s+x\s+", title, re.IGNORECASE)
         if m_qty:
             pack_qty = int(m_qty.group(1))
-
-        # Image — from container img, NOT og:image (broken on this site)
-        # Walk up from h3 to find a container with an img
-        container = h3
-        for _ in range(6):
-            container = container.parent
-            if container is None:
-                break
-            if container.name in ("li", "div", "article"):
-                break
-        image = ""
-        if container:
-            img_el = container.find("img")
-            if img_el:
-                src = (img_el.get("data-src") or img_el.get("src") or "")
-                if src and "logo" not in src.lower() and "blank" not in src.lower():
-                    image = src if src.startswith("http") else BASE_URL + src
 
         products.append({
             "id":            product_id,
@@ -190,8 +184,8 @@ def parse_listing_page(html):
             "pack_qty":      pack_qty,
         })
 
-    # Has next page?
-    has_next = bool(soup.find("a", href=lambda h: h and re.search(r"/products/new/\d+/", h or "")))
+    # Has next page — look for pagination link to next page number
+    has_next = bool(soup.find("a", href=re.compile(r"/products/new/\d+/")))
 
     return products, has_next
 
