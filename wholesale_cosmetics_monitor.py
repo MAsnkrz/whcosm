@@ -244,12 +244,25 @@ def fetch_product_detail(product):
     related_idx = full_text.lower().find("related products")
     main_text = full_text[:related_idx] if related_idx > 0 else full_text
 
-    # Barcode — try .barcodetext class first (site-specific)
+    # Barcode — .barcodetext class contains the EAN/barcode digits
+    # This class is always in the main product section (not related products)
     barcode_el = soup.find(class_="barcodetext")
     if barcode_el:
-        product["barcode"] = barcode_el.get_text(strip=True)
-    else:
-        m = re.search(r"(?:EAN|Barcode|GTIN)[\s:]+([0-9]{6,14})", main_text, re.IGNORECASE)
+        raw = barcode_el.get_text(strip=True)
+        # Extract only digits (ignore any label text)
+        digits = re.sub(r"[^\d]", "", raw)
+        product["barcode"] = digits if len(digits) >= 6 else ""
+    
+    if not product["barcode"]:
+        # Fallback: barcode image src often contains the EAN
+        for img in soup.find_all("img", src=re.compile(r"barcode", re.IGNORECASE)):
+            m = re.search(r"([0-9]{8,14})", img.get("src", ""))
+            if m:
+                product["barcode"] = m.group(1)
+                break
+    
+    if not product["barcode"]:
+        m = re.search(r"(?:EAN|Barcode|GTIN)[\s:]+([0-9]{6,14})", full_text, re.IGNORECASE)
         product["barcode"] = m.group(1) if m else ""
 
     # Brand
@@ -297,14 +310,16 @@ def vat(price_str):
     return f"{f * 1.2:.2f}" if f else price_str
 
 
-def sas_ean(barcode, cost):
+def sas_ean(barcode, cost_ex_vat):
+    """cost_ex_vat will be multiplied by 1.2 for the SAS inc-VAT cost price."""
     if not barcode:
         return None
-    return f"https://sas.selleramp.com/sas/lookup/?search_term={barcode}&sas_cost_price={vat(cost)}"
+    return f"https://sas.selleramp.com/sas/lookup/?search_term={barcode}&sas_cost_price={vat(cost_ex_vat)}"
 
 
-def sas_title(title, cost):
-    return f"https://sas.selleramp.com/sas/lookup/?search_term={quote(title)}&sas_cost_price={vat(cost)}"
+def sas_title(title, cost_ex_vat):
+    """cost_ex_vat will be multiplied by 1.2 for the SAS inc-VAT cost price."""
+    return f"https://sas.selleramp.com/sas/lookup/?search_term={quote(title)}&sas_cost_price={vat(cost_ex_vat)}"
 
 
 # ---------------------------------------------------------------------------
@@ -335,17 +350,19 @@ def _base_fields(product):
     rrp      = product.get("rrp", "")
     brand    = product.get("brand", "")
     is_bogof = product.get("is_bogof", False)
-    cost     = effective_price(product)
+
+    # SAS links use inc-VAT unit price (per_unit × 1.20)
+    sas_cost = vat(per_unit) if per_unit else vat(effective_price(product))
 
     fields = [
-        {"name": "🏷️ Brand",            "value": brand or "-",                                    "inline": True},
-        {"name": "📦 Pack Qty",          "value": f"{pack_qty} units" + (" 🎁 BOGOF" if is_bogof else ""), "inline": True},
-        {"name": "🏷️ RRP (each)",        "value": f"£{rrp}" if rrp else "-",                      "inline": True},
-        {"name": "🔢 Barcode / EAN",     "value": f"`{barcode}`" if barcode else "-",              "inline": True},
+        {"name": "🏷️ Brand",        "value": brand or "-",                                         "inline": True},
+        {"name": "📦 Pack Qty",      "value": f"{pack_qty} units" + (" 🎁 BOGOF" if is_bogof else ""), "inline": True},
+        {"name": "🏷️ RRP (each)",   "value": f"£{rrp}" if rrp else "-",                            "inline": True},
+        {"name": "🔢 Barcode / EAN", "value": f"`{barcode}`" if barcode else "-",                   "inline": True},
     ]
 
-    ean_url   = sas_ean(barcode, cost)
-    title_url = sas_title(product.get("title", ""), cost)
+    ean_url   = sas_ean(barcode, per_unit) if barcode else None
+    title_url = sas_title(product.get("title", ""), per_unit)
     if ean_url:
         fields.append({"name": "🔍 SAS EAN",   "value": f"[Search by barcode]({ean_url})",  "inline": True})
     fields.append(    {"name": "🔍 SAS Title", "value": f"[Search by title]({title_url})",  "inline": True})
