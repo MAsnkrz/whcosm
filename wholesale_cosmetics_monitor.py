@@ -524,16 +524,23 @@ def run_check():
         is_new = pid in new_ids
         old    = snapshot.get(pid, {})
 
-        # Step 2: Scrape detail page ONLY for new products
-        if is_new and not is_first_run:
+        # Step 2: Determine if we need a detail page scrape
+        # Scrape for: new products, AND back-in-stock products missing barcode/brand
+        was_in_stock  = old.get("in_stock", True)
+        now_in_stock  = True   # it's on the listing
+        is_back       = not was_in_stock and now_in_stock and not is_new
+        missing_detail = not old.get("barcode") and not old.get("brand")
+
+        needs_detail = (
+            (is_new and not is_first_run) or
+            (is_back and missing_detail)   # back in stock but no cached barcode
+        )
+
+        if needs_detail:
             time.sleep(DETAIL_DELAY)
             product = fetch_product_detail(product)
 
-        elif is_new and is_first_run:
-            # On baseline, carry image/barcode if we already have it
-            pass  # no detail scrape on first run — keep it fast
-
-        # Carry forward cached fields for existing products
+        # Carry forward cached fields for all existing products
         if not is_new:
             for key in ("barcode", "brand", "image", "pack_size", "rrp"):
                 if not product.get(key):
@@ -560,7 +567,7 @@ def run_check():
             continue
 
         # Back in stock (was marked OOS, now on listing)
-        if not old.get("in_stock", True):
+        if is_back:
             notify_back_in_stock(product)
             alerts_sent += 1
             time.sleep(1.5)
