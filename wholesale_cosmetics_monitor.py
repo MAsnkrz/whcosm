@@ -196,7 +196,10 @@ def fetch_all_products():
     seen_ids = set()
     page = 1
 
-    while True:
+    MAX_PAGES          = 100
+    consecutive_empty  = 0
+
+    while page <= MAX_PAGES:
         url = f"{LISTING_URL}{page}/"
         html = fetch_page(url)
         if not html:
@@ -205,6 +208,18 @@ def fetch_all_products():
 
         products, has_next = parse_listing_page(html)
 
+        if not products:
+            # Page returned nothing — site may have ended
+            consecutive_empty += 1
+            print(f"  Page {page}: empty ({consecutive_empty} consecutive empty)")
+            if consecutive_empty >= 3:
+                print("  3 consecutive empty pages — done")
+                break
+            page += 1
+            time.sleep(PAGE_DELAY)
+            continue
+
+        consecutive_empty = 0
         new = [p for p in products if p["id"] not in seen_ids]
         for p in new:
             seen_ids.add(p["id"])
@@ -212,7 +227,8 @@ def fetch_all_products():
 
         print(f"  Page {page}: +{len(new)} products (total: {len(all_products)})")
 
-        if not new or not has_next:
+        if not has_next:
+            print(f"  No next page — done")
             break
 
         page += 1
@@ -531,9 +547,19 @@ def run_check():
         is_back       = not was_in_stock and now_in_stock and not is_new
         missing_detail = not old.get("barcode") and not old.get("brand")
 
+        # Will this product fire a price drop alert?
+        old_price_check = old.get("reduced_price") or old.get("pack_price") or ""
+        new_price_check = product.get("reduced_price") or product.get("pack_price") or ""
+        old_f_check     = safe_float(old_price_check)
+        new_f_check     = safe_float(new_price_check)
+        will_drop       = (not is_new and old_f_check and new_f_check and old_f_check > 0
+                           and (old_f_check - new_f_check) / old_f_check > 0.01
+                           and (old_f_check - new_f_check) > 0.02)
+
         needs_detail = (
             (is_new and not is_first_run) or
-            (is_back and missing_detail)   # back in stock but no cached barcode
+            (is_back and missing_detail) or           # back in stock, no cached barcode
+            (will_drop and missing_detail)             # price drop, no cached barcode
         )
 
         if needs_detail:
