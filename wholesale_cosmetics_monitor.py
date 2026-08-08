@@ -273,22 +273,24 @@ def fetch_product_detail(product):
         # Extract only digits (ignore any label text)
         digits = re.sub(r"[^\d]", "", raw)
         product["barcode"] = digits if len(digits) >= 6 else ""
-    
-    if not product["barcode"]:
+    else:
+        product["barcode"] = product.get("barcode", "")
+
+    if not product.get("barcode", ""):
         # Fallback: barcode image src often contains the EAN
         for img in soup.find_all("img", src=re.compile(r"barcode", re.IGNORECASE)):
             m = re.search(r"([0-9]{8,14})", img.get("src", ""))
             if m:
                 product["barcode"] = m.group(1)
                 break
-    
-    if not product["barcode"]:
+
+    if not product.get("barcode", ""):
         m = re.search(r"(?:EAN|Barcode|GTIN)[\s:]+([0-9]{6,14})", full_text, re.IGNORECASE)
         product["barcode"] = m.group(1) if m else ""
 
     # Brand
     brand_m = re.search(r"Brand:\s*([^\n,]+)", main_text, re.IGNORECASE)
-    product["brand"] = brand_m.group(1).strip() if brand_m else ""
+    product["brand"] = brand_m.group(1).strip() if brand_m else product.get("brand", "")
 
     # Pack size
     ps_m = re.search(r"Pack\s+Size:\s*(\d+)\s*units?", main_text, re.IGNORECASE)
@@ -296,11 +298,9 @@ def fetch_product_detail(product):
 
     # RRP
     rrp_m = re.search(r"RRP\s*£?([\d.]+)\s*each", main_text, re.IGNORECASE)
-    product["rrp"] = rrp_m.group(1) if rrp_m else ""
+    product["rrp"] = rrp_m.group(1) if rrp_m else product.get("rrp", "")
 
     # Better image — find main product image before Related Products
-    # og:image is broken on this site (returns URL with no filename)
-    # Instead look for real product image patterns
     if not product.get("image"):
         for img in soup.find_all("img", src=re.compile(r"\.(jpg|jpeg|png|webp)", re.IGNORECASE)):
             src = img.get("src", "")
@@ -358,12 +358,15 @@ def _send(payload):
             time.sleep(wait)
             requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
         elif r.status_code == 400:
-            print(f"  [!] Discord 400 — response: {r.text[:300]}")
-            # Try to identify the bad field
-            for embed in payload.get("embeds", []):
-                for f in embed.get("fields", []):
-                    if not f.get("value") or f.get("value") == "":
-                        print(f"  [!] Empty field detected: {f.get('name')}")
+            print(f"  [!] Discord 400 — response: {r.text[:500]}")
+            # Debug: print embed structure
+            for i, embed in enumerate(payload.get("embeds", [])):
+                print(f"  Embed {i}: title={str(embed.get('title',''))[:50]!r}")
+                print(f"  Embed {i}: url={str(embed.get('url',''))[:80]!r}")
+                for j, f in enumerate(embed.get("fields", [])):
+                    v = f.get("value", "")
+                    if not v or len(str(v)) > 1000:
+                        print(f"  [!] Field {j} issue: name={f.get('name')!r} value_len={len(str(v))}")
         else:
             r.raise_for_status()
     except Exception as e:
