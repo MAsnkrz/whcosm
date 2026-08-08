@@ -357,6 +357,13 @@ def _send(payload):
             print(f"  [!] Discord rate limited — waiting {wait:.1f}s")
             time.sleep(wait)
             requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        elif r.status_code == 400:
+            print(f"  [!] Discord 400 — response: {r.text[:300]}")
+            # Try to identify the bad field
+            for embed in payload.get("embeds", []):
+                for f in embed.get("fields", []):
+                    if not f.get("value") or f.get("value") == "":
+                        print(f"  [!] Empty field detected: {f.get('name')}")
         else:
             r.raise_for_status()
     except Exception as e:
