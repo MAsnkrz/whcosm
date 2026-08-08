@@ -413,14 +413,16 @@ def _sanitise_fields(fields):
 def _embed(title, url, colour, fields, product, footer_extra=""):
     embed = {
         "title":     (title or "Alert")[:256],
-        "url":       url or "",
         "color":     colour,
         "fields":    _sanitise_fields(fields),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer":    {"text": f"Wholesale Cosmetics Monitor • wholesale-cosmetics.co.uk{footer_extra}"},
     }
+    # Only add url if it's a valid non-empty string — Discord rejects empty string urls
+    if url and url.startswith("http"):
+        embed["url"] = url
     image = product.get("image", "")
-    if image:
+    if image and image.startswith("http"):
         embed["thumbnail"] = {"url": image}
     return embed
 
