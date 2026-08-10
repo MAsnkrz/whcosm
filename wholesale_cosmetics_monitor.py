@@ -531,6 +531,7 @@ def to_entry(product):
         "in_stock":      product.get("in_stock", True),
         "first_seen":    product.get("first_seen", datetime.now(timezone.utc).isoformat()),
         "last_updated":  datetime.now(timezone.utc).isoformat(),
+        "missing_runs":  product.get("missing_runs", 0),
     }
 
 # ---------------------------------------------------------------------------
@@ -635,11 +636,22 @@ def run_check():
         entry["first_seen"] = old.get("first_seen", entry["first_seen"])
         snapshot[pid] = entry
 
-    # Mark gone products as OOS in snapshot (don't delete — needed for back-in-stock detection)
+    # Mark gone products as OOS — but only after missing for 3 consecutive runs
+    # This prevents false OOS/back-in-stock alerts caused by pagination stopping early
     for pid in gone_ids:
         if pid in snapshot:
-            snapshot[pid]["in_stock"] = False
+            missing = snapshot[pid].get("missing_runs", 0) + 1
+            snapshot[pid]["missing_runs"] = missing
             snapshot[pid]["last_updated"] = datetime.now(timezone.utc).isoformat()
+            if missing >= 3:
+                # Genuinely gone — mark OOS
+                snapshot[pid]["in_stock"] = False
+            # else: don't mark OOS yet — might just be a pagination miss
+
+    # Reset missing_runs counter for products found this run
+    for pid in current_ids:
+        if pid in snapshot and snapshot[pid].get("missing_runs", 0) > 0:
+            snapshot[pid]["missing_runs"] = 0
 
     save_snapshot(snapshot)
 
